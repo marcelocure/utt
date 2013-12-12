@@ -3,6 +3,7 @@ PROMPT Installation started
 PROMPT
 
 create or replace package utt_logger is
+--Author: Marcelo Cure
   type logger is record (id number,
                          test varchar2(32),
                          result varchar2(400));
@@ -13,11 +14,10 @@ create or replace package utt_logger is
   tb_logger t_logger;
   v_statistics statistics;
   v_idx number := 0;
-  procedure add(p_result in varchar2);
+  procedure add(p_result in varchar2, p_procedure in varchar2);
   procedure print_logger;
 end utt_logger;
 /
-
 create or replace package body utt_logger is
   procedure clean_cache is
   begin
@@ -27,12 +27,12 @@ create or replace package body utt_logger is
     v_statistics.passed_tests := 0;
     v_statistics.total_tests := 0;
   end;
-  
+
   procedure increment_id is
   begin
     v_idx := v_idx + 1;
   end;
-  
+
   procedure add_statistics is
   begin
     if tb_logger(v_idx).result like 'failed%' then
@@ -42,29 +42,29 @@ create or replace package body utt_logger is
     end if;
     v_statistics.total_tests := v_statistics.total_tests + 1;
   end;
-  
-  procedure add(p_result in varchar2) is
+
+  procedure add(p_result in varchar2, p_procedure in varchar2) is
   begin
     increment_id;
     tb_logger(v_idx).id := v_idx;
-    tb_logger(v_idx).test := utt.curr_procedure;
+    tb_logger(v_idx).test := p_procedure;
     tb_logger(v_idx).result := p_result;
     add_statistics;
   end;
-  
+
   procedure print_statistics is
   begin
     dbms_output.put_line('');
     dbms_output.put_line('### Statistics');
     dbms_output.put_line('Total passed tests: '||v_statistics.passed_tests);
     dbms_output.put_line('Total failed tests: '||v_statistics.failed_tests);
-    dbms_output.put_line('');
+    dbms_output.put_line('-----------------------');
     dbms_output.put_line('Total tests: '||v_statistics.total_tests);
   end;
-  
+
   procedure print_results is
   begin
-    dbms_output.put_line('### Running tests for '||utt.curr_package);
+    dbms_output.put_line('### Running tests');
     dbms_output.put_line('');
     dbms_output.put_line('   '||rpad('Procedure',40,' ') || 'Result');
     dbms_output.put_line('   '||rpad('-',46,'-'));
@@ -72,26 +72,29 @@ create or replace package body utt_logger is
       dbms_output.put_line('   '||rpad(tb_logger(i).test,40,' ') || tb_logger(i).result);
     end loop;
   end;
-  
+
   procedure print_logger is
   begin
     print_results;
     print_statistics;
     clean_cache;
   end;
-  
+
 begin
   dbms_output.enable(buffer_size => null);
   clean_cache;
 end utt_logger;
 /
 
+
 create or replace package utt is
+--Author: Marcelo Cure
   e_many_columns exception;
+  e_tests_failed exception;
+  any_test_failed boolean := false;
   curr_procedure varchar2(32);
   curr_package varchar2(32);
-  procedure run_all_tests(p_package in varchar2, p_owner in varchar2);
-  procedure run_single_test(p_package in varchar2, p_test in varchar2);
+  procedure run_all_tests(p_owner in varchar2 default user, p_package in varchar2);
   procedure assert_equals(p_expected in varchar2, p_actual in varchar2);
   procedure assert_not_equals(p_expected in varchar2, p_actual in varchar2);
   procedure assert_true(p_actual in boolean);
@@ -105,16 +108,18 @@ create or replace package utt is
   procedure assert_query_same_value(p_query1 in varchar2, p_query2 in varchar2);
   procedure assert_query_diff_value(p_query1 in varchar2, p_query2 in varchar2);
   procedure assert_dml_rowcount(p_expected in number);
+  procedure assert_rownum_greater_than(p_table_name in varchar2, p_expected in number);
+  procedure assert_rownum_lower_than(p_table_name in varchar2, p_expected in number);
+  procedure assert_rownum_equals(p_table_name in varchar2, p_expected in number);
 end utt;
 /
-
 create or replace package body utt is
   procedure execute_plsql(p_plsql in varchar2) is
   begin
     execute immediate p_plsql;
   end;
-  
-  procedure run_all_tests(p_package in varchar2, p_owner in varchar2) is
+
+  procedure run_all_tests(p_owner in varchar2 default user , p_package in varchar2) is
     cursor c_tests is
       select procedure_name
       from all_procedures
@@ -128,7 +133,7 @@ create or replace package body utt is
     loop
       fetch c_tests into curr_procedure ;
       exit when c_tests%notfound;
-      execute_plsql(replace(v_model,'<PROCEDURE>',curr_procedure));
+      execute immediate replace(v_model,'<PROCEDURE>',curr_procedure);
     end loop;
     close c_tests;
     utt_logger.print_logger;
@@ -137,18 +142,11 @@ create or replace package body utt is
       dbms_output.put_line(sqlerrm);
       dbms_output.put_line(dbms_utility.format_error_backtrace);
   end;
-  
-  procedure run_single_test(p_package in varchar2, p_test in varchar2) is
-    v_model varchar2(200) := 'begin '||p_package||'.'||p_test||'; end;';
-  begin
-    curr_package := p_package;
-    execute_plsql(v_model);
-  end;
-  
+
   function build_failed_message(p_expected in varchar2, p_actual in varchar2) return varchar2 is
   begin
     return 'failed: expected "'||p_expected||'" but got "'||p_actual||'"';
-  end;  
+  end;
 
   function is_select_clausule_invalid(p_without_from in varchar2) return boolean is
   begin
@@ -157,7 +155,7 @@ create or replace package body utt is
     end if;
     return false;
   end;
-  
+
   function validate_query(p_query in varchar2) return boolean is
     v_without_select varchar2(100) := substr(p_query,instr(p_query,' '));
     v_without_from varchar2(100) := substr(v_without_select,1,instr(v_without_select,'from')-1);
@@ -168,60 +166,85 @@ create or replace package body utt is
     return true;
   end;
   
+  procedure get_rownum(p_table_name in varchar2, p_object_exists out boolean, p_rowcount out number) is
+    cursor c_rownum is
+      select num_rows
+      from all_tables
+      where upper(table_name) = upper(p_table_name);
+    v_rowcount number;
+    v_object_exists boolean := true;
+  begin
+    open c_rownum;
+    fetch c_rownum into v_rowcount;
+    if c_rownum%notfound then
+      v_object_exists := false;
+      utt_logger.add(p_result => 'table or view doesn''t exist', p_procedure => curr_procedure);
+    end if;
+    close c_rownum;
+    p_rowcount := v_rowcount;
+    p_object_exists := v_object_exists;
+  end;
+
   procedure assert_equals(p_expected in varchar2, p_actual in varchar2) is
   begin
     if p_expected = p_actual then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed',p_procedure => curr_procedure);
     else
-      utt_logger.add(p_result => build_failed_message(p_expected,p_actual));
+      any_test_failed := true;
+      utt_logger.add(p_result => build_failed_message(p_expected,p_actual), p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_not_equals(p_expected in varchar2, p_actual in varchar2) is
   begin
     if p_expected != p_actual then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message(p_expected,p_actual));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message(p_expected,p_actual), p_procedure => curr_procedure);
     end if;
   end;
 
   procedure assert_true(p_actual in boolean) is
   begin
     if p_actual then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message('true','false'));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message('true','false'), p_procedure => curr_procedure);
     end if;
   end;
 
   procedure assert_false(p_actual in boolean) is
   begin
     if not p_actual then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message('false','true'));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message('false','true'), p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_null(p_actual in varchar2) is
   begin
     if p_actual is null then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message('not null',p_actual));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message('not null',p_actual),p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_not_null(p_actual in varchar2) is
   begin
     if p_actual is not null then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message('null',p_actual));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message('null',p_actual), p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_object_exists(p_object_name in varchar2) is
     cursor c_get_object is
       select object_name
@@ -232,14 +255,15 @@ create or replace package body utt is
     open c_get_object;
     fetch c_get_object into v_object_name;
     close c_get_object;
-    
+
     if upper(p_object_name) = v_object_name then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message(upper(p_object_name),v_object_name));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message(upper(p_object_name),v_object_name), p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_object_not_exists(p_object_name in varchar2) is
     cursor c_get_object is
       select object_name
@@ -250,14 +274,15 @@ create or replace package body utt is
     open c_get_object;
     fetch c_get_object into v_object_name;
     close c_get_object;
-    
+
     if v_object_name = 'object doesn''t exist' then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add(build_failed_message('NONE',v_object_name));
+      any_test_failed := true;
+      utt_logger.add(build_failed_message('NONE',v_object_name), p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_query_same_countrows(p_query1 in varchar2, p_query2 in varchar2) is
     v_query1 varchar2(4000) := 'select count(1) from ('||p_query1||')';
     v_query2 varchar2(4000) := 'select count(1) from ('||p_query2||')';
@@ -266,14 +291,15 @@ create or replace package body utt is
   begin
     execute immediate v_query1 into v_count_rows_query1;
     execute immediate v_query2 into v_count_rows_query2;
-    
+
     if v_count_rows_query1 = v_count_rows_query2 then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add('failed query 1 returns '||v_count_rows_query1||' rows and query2 returns '||v_count_rows_query2||' rows');
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed query 1 returns '||v_count_rows_query1||' rows and query2 returns '||v_count_rows_query2||' rows', p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_query_diff_countrows(p_query1 in varchar2, p_query2 in varchar2) is
     v_query1 varchar2(4000) := 'select count(1) from ('||p_query1||')';
     v_query2 varchar2(4000) := 'select count(1) from ('||p_query2||')';
@@ -282,14 +308,15 @@ create or replace package body utt is
   begin
     execute immediate v_query1 into v_count_rows_query1;
     execute immediate v_query2 into v_count_rows_query2;
-    
+
     if v_count_rows_query1 != v_count_rows_query2 then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add('failed query 1 returns '||v_count_rows_query1||' rows and query2 returns '||v_count_rows_query2||' rows');
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed query 1 returns '||v_count_rows_query1||' rows and query2 returns '||v_count_rows_query2||' rows', p_procedure => curr_procedure);
     end if;
   end;
-  
+
   procedure assert_query_same_value(p_query1 in varchar2, p_query2 in varchar2) is
     v_value_query1 varchar2(4000);
     v_value_query2 varchar2(4000);
@@ -297,20 +324,21 @@ create or replace package body utt is
     if not validate_query(p_query1) or not validate_query(p_query2) then
       raise e_many_columns;
     end if;
-    
+
     execute immediate p_query1 into v_value_query1;
     execute immediate p_query2 into v_value_query2;
-    
+
     if v_value_query1 = v_value_query2 then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add('failed query 1 returns '||v_value_query1||' and query2 returns '||v_value_query2);
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed query 1 returns '||v_value_query1||' and query2 returns '||v_value_query2, p_procedure => curr_procedure);
     end if;
   exception
     when e_many_columns then
-      utt_logger.add('more than one column on select clausule');
+      utt_logger.add(p_result => 'more than one column on select clausule', p_procedure => curr_procedure);
   end;
-  
+
   procedure assert_query_diff_value(p_query1 in varchar2, p_query2 in varchar2) is
     v_value_query1 varchar2(4000);
     v_value_query2 varchar2(4000);
@@ -318,31 +346,80 @@ create or replace package body utt is
     if not validate_query(p_query1) or not validate_query(p_query2) then
       raise e_many_columns;
     end if;
-  
+
     execute immediate p_query1 into v_value_query1;
     execute immediate p_query2 into v_value_query2;
-    
+
     if v_value_query1 != v_value_query2 then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add('failed query 1 returns '||v_value_query1||' and query2 returns '||v_value_query2);
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed query 1 returns '||v_value_query1||' and query2 returns '||v_value_query2, p_procedure => curr_procedure);
     end if;
   exception
     when e_many_columns then
-      utt_logger.add('more than one column on select clausule');
+      utt_logger.add(p_result => 'more than one column on select clausule',
+                     p_procedure => curr_procedure);
   end;
-  
+
   procedure assert_dml_rowcount(p_expected in number) is
     v_rowcount number := sql%rowcount;
   begin
     if v_rowcount = p_expected then
-      utt_logger.add(p_result => 'passed');
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
     else
-      utt_logger.add('failed expected '||p_expected||' but inserted '||v_rowcount||' records');
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed expected '||p_expected||' but inserted '||v_rowcount||' records', p_procedure => curr_procedure);
+    end if;
+  end;
+  
+  procedure assert_rownum_greater_than(p_table_name in varchar2, p_expected in number) is
+    v_rowcount number;
+    v_object_exists boolean;
+  begin
+    get_rownum(p_table_name => p_table_name,
+               p_object_exists => v_object_exists,
+               p_rowcount => v_rowcount);
+    if v_rowcount > p_expected then
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
+    elsif v_object_exists then
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed expected more than'||p_expected||' but got '||v_rowcount, p_procedure => curr_procedure);
+    end if;
+  end;
+  
+  procedure assert_rownum_lower_than(p_table_name in varchar2, p_expected in number) is
+    v_rowcount number;
+    v_object_exists boolean;
+  begin
+    get_rownum(p_table_name => p_table_name,
+               p_object_exists => v_object_exists,
+               p_rowcount => v_rowcount);
+    if v_rowcount < p_expected then
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
+    elsif v_object_exists then
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed expected less than'||p_expected||' but got '||v_rowcount, p_procedure => curr_procedure);
+    end if;
+  end;
+  
+  procedure assert_rownum_equals(p_table_name in varchar2, p_expected in number) is
+    v_rowcount number;
+    v_object_exists boolean;
+  begin
+    get_rownum(p_table_name => p_table_name,
+               p_object_exists => v_object_exists,
+               p_rowcount => v_rowcount);
+    if v_rowcount = p_expected then
+      utt_logger.add(p_result => 'passed', p_procedure => curr_procedure);
+    elsif v_object_exists then
+      any_test_failed := true;
+      utt_logger.add(p_result => 'failed expected '||p_expected||' but got '||v_rowcount, p_procedure => curr_procedure);
     end if;
   end;
 end utt;
 /
+
 
 alter package utt_logger compile;
 /
